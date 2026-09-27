@@ -1,67 +1,113 @@
 # Glass (khwan.glass)
 
-Milky-glass control panel for the omarchy bar: frosted window opacity, compositor
-blur, rounding, and dim — sliders in the bar, live-apply while dragging.
+Milky-glass control panel for the [Omarchy](https://omarchy.org) bar: frosted
+window opacity, compositor blur, rounding, and dim — sliders in the bar with
+live-apply while dragging.
 
-## What it does
+![The Glass panel over frosted windows](preview.png)
 
-- **Presets — 10 styles** (see `PRESETS.md` in the project mirror for the design
-  reasoning): Milky · Cloud · Frosted (light) · Smoke · Ink (dark, via blur
-  brightness < 1) · Crystal (sheer) · Veil · Gauze (sheer-readable: the
-  wallpaper stays clearly visible, text keeps its contrast) · Crisp (reading) ·
-  Stock (removes the managed block; omarchy defaults return). The panel shows
-  which preset the current look matches, or **Custom**.
-- **⇅ Sync all** — one click removes every per-app rule so all windows follow
-  "All apps". Undoable.
-- **FROST** — global + per-app window opacity (release-apply: rewrites the
-  managed block in `~/.config/hypr/looknfeel.lua` + `hyprctl reload`, which
-  re-frosts open windows), add/remove per-app rows, `S` = keep-solid opt-out.
-- **BLUR** — on/off, size, passes, brightness, contrast, noise (live while
-  dragging via `hyprctl eval hl.config(...)`; persisted + block rewrite on
-  release, no reload).
-- **SHAPES** — rounded-corners switch (off = square windows, on = restore the
-  last radius), rounding slider, dim-inactive + strength (live).
+## Install
+
+```sh
+omarchy plugin add https://github.com/Khwan888/khwan.glass.git --enable
+```
+
+Omarchy clones the current upstream repository, validates it locally, and only
+then installs and enables the plugin.
+
+## Remove
+
+```sh
+omarchy plugin remove khwan.glass --yes
+```
+
+Removal deletes the plugin checkout. To restore the stock look, pick
+**Stock** in the panel (`0`) or run `scripts/glass-ctl preset stock` *before*
+removing. If you remove without doing that, these stay behind: the managed
+block in `~/.config/hypr/looknfeel.lua`, the state file
+`~/.local/state/omarchy/glass.json`, and the rolling backups
+`looknfeel.lua.bak.*` (newest 10). Clearing the block or restoring a backup
+brings stock back later.
+
+## What it writes
+
+Nothing is written until *you* change a setting.
+
+- The first slider move (or preset, sync, corners switch) splices a **managed
+  block** between `-- BEGIN/END khwan.glass` markers in
+  `~/.config/hypr/looknfeel.lua`. Only that block is ever touched, and every
+  write takes a `.bak` copy first.
+- If the file had a hand-written "milky glass" section from before the
+  plugin, it is adopted on that first write: values are read into the panel,
+  and the old lines are trimmed only when they contain nothing but glass
+  settings — otherwise the file is left exactly as it was and the block is
+  appended at the end.
+- State, including your saved presets, lives in
+  `~/.local/state/omarchy/glass.json`.
+
+## Features
+
+- **10 styles** — Milky · Cloud · Frosted · Smoke · Ink · Crystal · Veil ·
+  Gauze · Crisp · Stock. The panel shows which one the current look matches,
+  or **Custom**.
+- **⇅ Sync all** — drop every per-app rule so all windows follow "All apps".
+  Undoable.
+- **FROST** — global and per-app window opacity; release-apply rewrites the
+  block and reloads so open windows re-frost. Keep a window solid with `S`.
+- **BLUR** — on/off, size, passes, brightness, contrast, noise — live while
+  dragging.
+- **SHAPES** — square/rounded corners switch, rounding, dim-inactive and
+  strength.
 - **BAR** — transparent bar toggle.
-- **Undo stack (session)** — every change is one Undo away; **Revert** restores
-  the newest `looknfeel.lua.bak.*`.
-- **Style tour** — right-click the icon applies the next favorite (Cloud →
-  Smoke → Ink → Crystal → Milky) with a 10s keep-or-revert trial.
-- **User presets** — "+ Save as…" snapshots the current look; saved ones appear
-  as chips (✕ to delete).
+- **Undo stack** (session) and **Revert** (restores the newest backup).
+- **Style tour** — right-click the icon: Cloud → Smoke → Ink → Crystal →
+  Milky, with a 10-second keep-or-revert trial.
+- **User presets** — save any look under your own name; it appears as a chip.
 
 ## Bar icon gestures
 
-click = panel · wheel = frost ±0.05 · right-click = style tour (10s trial) ·
-middle-click = blur on/off
+click = panel · wheel = frost ±0.05 · right-click = style tour · middle-click = blur on/off
 
-Panel keys: `1-9` + `0` presets (0 = Stock) · `u` undo · `r` revert
+Panel keys: `1-9` + `0` styles (0 = Stock) · `u` undo · `r` revert
 
-## Files
+## Requirements
 
-- `Glass.qml` — bar widget + panel UI
-- `GlassIcon.qml` — canvas-drawn frosted-square glyph
-- `Service.qml` — startup init; IPC target `khwan.glass.service`
-  (get/set/preset/sync/round/savepreset/delpreset/revert)
-- `WheelSafeSlider.qml` — wheel-safe slider (copied from im0001gt.screens)
-- `scripts/glass-ctl` — state, Lua block generation, hyprctl apply paths, presets
-- `tests/test_blockgen.py` — golden tests (run: `python3 tests/test_blockgen.py`)
-
-## State
-
-`~/.local/state/omarchy/glass.json` mirrors the managed block between
-`-- BEGIN/END khwan.glass` markers in `~/.config/hypr/looknfeel.lua`. The Lua file
-wins on panel open (hand-edits are adopted); user presets live in the state file.
+- Omarchy (Quattro) with Hyprland.
+- `python3` (standard library only — nothing extra to install) and `hyprctl`,
+  both already on Omarchy.
+- User space only: no elevated permissions, no daemon, no network access.
 
 ## CLI
 
+The panel is a front-end for `scripts/glass-ctl`:
+
 ```
-scripts/glass-ctl get | readback | set '<json>' | live '<json>' | frost '<json>'
-                 | persist '<json>' | preset milky|cloud|frosted|smoke|ink|crystal|veil|gauze|crisp|stock|<user>
-                 | savepreset '<name>' | delpreset '<name>' | sync
-                 | round true|false|toggle
-                 | revert | classes | bar true|false|toggle | init
+glass-ctl get | readback | set '<json>' | live '<json>' | frost '<json>'
+        | persist '<json>' | preset <name> | savepreset '<name>'
+        | delpreset '<name>' | sync | round true|false|toggle
+        | revert | classes | bar true|false|toggle | init
 ```
 
-All responses carry `state`, `active` (matched preset or null = Custom),
-`user` (user preset names), and `tour`. Widget IPC:
-`quickshell -p /usr/share/omarchy/shell ipc call khwan.glass open|close|toggle`
+Responses are JSON carrying `state`, `active` (matched style or null), `user`,
+and `tour`. IPC (same actions):
+
+```
+quickshell -p /usr/share/omarchy/shell ipc call khwan.glass open|close|toggle
+```
+
+## Files
+
+- `Glass.qml` — bar widget and panel UI
+- `GlassIcon.qml` — canvas-drawn frosted-square glyph
+- `Service.qml` — startup adoption and IPC (`khwan.glass.service`)
+- `WheelSafeSlider.qml` — wheel-safe slider (see Credits)
+- `scripts/glass-ctl` — state, Lua block generation, hyprctl apply, presets
+- `tests/` — golden and smoke suites: `bash tests/run.sh`
+
+## Credits
+
+- `WheelSafeSlider.qml` is adapted from the `im0001gt.screens` plugin (MIT).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -58,7 +58,7 @@ DEFAULT_STATE = {
     "userPresets": {},
 }
 
-# The 10-style set (PRESETS.md): light / dark / sheer / sheer-readable /
+# The 10-style set: light / dark / sheer / sheer-readable /
 # utility. Each preset owns one idea; darkness comes from blur brightness < 1,
 # not opacity. Presets set frost.all, blur, and shapes but deliberately leave
 # per-app rows alone.

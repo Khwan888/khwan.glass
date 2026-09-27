@@ -1,3 +1,4 @@
+// Adapted from the im0001gt.screens Omarchy plugin (MIT).
 import QtQuick
 import qs.Commons
 

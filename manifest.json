@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "khwan.glass",
+  "name": "Glass",
+  "version": "1.1.0",
+  "author": "Gordon Wan",
+  "license": "MIT",
+  "description": "Milky-glass control panel: frosted window opacity, compositor blur, rounding, and dim — 8 preset styles, sync-all, style tour, undo — sliders in the bar, live-apply on drag.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Glass.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Glass",
+    "description": "Slide frost, blur, rounding, and dim from the bar. 8 preset styles (light/dark/sheer/utility), ⇅ sync all apps, per-app keep-solid, undo, right-click style tour. Frost rewrites looknfeel.lua and reloads; blur and shapes apply live.",
+    "category": "Appearance",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

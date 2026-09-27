@@ -1,0 +1,842 @@
+#!/usr/bin/env python3
+"""Glass — milky-glass control for the omarchy bar (khwan.glass).
+
+Commands:
+  get                 print state + active preset JSON
+  readback            print state parsed from the live looknfeel.lua block
+  presets             print active preset + builtin/user preset names
+  set <json>          partial state update; blur/shapes apply live, frost on write
+  live <json>         apply blur/shapes live ONLY (drag ticks; no state write)
+  frost <json>        rewrite managed block + hyprctl reload (release)
+  persist <json>      persist blur/shapes + block rewrite, NO reload (release)
+  preset <name>       milky|cloud|frosted|smoke|ink|crystal|veil|gauze|crisp|stock|<user preset>
+  savepreset <name>   snapshot the current look as a user preset
+  delpreset <name>    delete a user preset
+  sync                remove every per-app rule — all windows follow "All apps"
+  round true|false|toggle
+                      window corners: false = square, true = on (last radius)
+  classes             list candidate window classes (for "add app" picker)
+  migrate             first-run adoption of hand-written glass settings
+  revert              restore newest looknfeel.lua.bak.* and reload
+  init                adopt-or-default; called by the service at startup
+
+State:  ~/.local/state/omarchy/glass.json
+Block:  ~/.config/hypr/looknfeel.lua between BEGIN/END khwan.glass markers
+"""
+from __future__ import annotations
+
+import copy
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+STATE_PATH = os.path.join(HOME, ".local/state/omarchy/glass.json")
+LOCK_PATH = os.path.join(HOME, ".local/state/omarchy/glass.lock")
+LOOKNFEEL = os.path.join(HOME, ".config/hypr/looknfeel.lua")
+MANAGED_BEGIN = "-- BEGIN khwan.glass (managed by the Glass bar panel — edits are overwritten; use the panel)"
+MANAGED_END = "-- END khwan.glass"
+
+DEFAULT_STATE = {
+    "version": 1,
+    # no default per-app rows: DEFAULT_STATE must never resurrect rows the user
+    # deleted (see load_state — an empty apps dict on disk is meaningful)
+    "frost": {"all": 0.85, "apps": {}, "keepSolid": []},
+    "blur": {"enabled": True, "size": 14, "passes": 3,
+             "brightness": 1.0, "contrast": 1.0, "noise": 0.011},
+    "shapes": {"rounding": 0, "dimInactive": False, "dimStrength": 0.15},
+    "bar": {"transparent": False},
+    # last non-zero corner radius — the SHAPES corners switch restores this
+    "roundingMem": 16,
+    "userPresets": {},
+}
+
+# The 10-style set (PRESETS.md): light / dark / sheer / sheer-readable /
+# utility. Each preset owns one idea; darkness comes from blur brightness < 1,
+# not opacity. Presets set frost.all, blur, and shapes but deliberately leave
+# per-app rows alone.
+PRESETS = {
+    "milky": {"frost": {"all": 0.85},
+              "blur": {"enabled": True, "size": 14, "passes": 3, "brightness": 1.0,
+                       "contrast": 1.0, "noise": 0.011},
+              "shapes": {"rounding": 0, "dimInactive": False, "dimStrength": 0.15}},
+    "cloud": {"frost": {"all": 0.78},
+              "blur": {"enabled": True, "size": 20, "passes": 4, "brightness": 1.15,
+                       "contrast": 0.95, "noise": 0.02},
+              "shapes": {"rounding": 12, "dimInactive": False, "dimStrength": 0.15}},
+    "frosted": {"frost": {"all": 0.88},
+                "blur": {"enabled": True, "size": 16, "passes": 4, "brightness": 1.05,
+                         "contrast": 0.92, "noise": 0.045},
+                "shapes": {"rounding": 6, "dimInactive": False, "dimStrength": 0.15}},
+    "smoke": {"frost": {"all": 0.80},
+              "blur": {"enabled": True, "size": 18, "passes": 4, "brightness": 0.70,
+                       "contrast": 1.02, "noise": 0.012},
+              "shapes": {"rounding": 8, "dimInactive": True, "dimStrength": 0.18}},
+    "ink": {"frost": {"all": 0.92},
+            "blur": {"enabled": True, "size": 24, "passes": 5, "brightness": 0.55,
+                     "contrast": 1.10, "noise": 0.006},
+            "shapes": {"rounding": 16, "dimInactive": True, "dimStrength": 0.30}},
+    "crystal": {"frost": {"all": 0.55},
+                "blur": {"enabled": True, "size": 10, "passes": 3, "brightness": 1.05,
+                         "contrast": 1.0, "noise": 0.008},
+                "shapes": {"rounding": 4, "dimInactive": False, "dimStrength": 0.15}},
+    # sheer-readable pair: watch the wallpaper, keep the text. Veil tones the
+    # world down (brightness < 1) so light text holds; Gauze keeps it vivid.
+    # Tuning note: readability ∝ 1/(transmission), wallpaper clarity ∝
+    # (1-frost)×brightness — the pair spans that dial (Veil ≈ .29, Gauze ≈ .35).
+    "veil": {"frost": {"all": 0.67},
+             "blur": {"enabled": True, "size": 16, "passes": 4, "brightness": 0.88,
+                      "contrast": 1.02, "noise": 0.009},
+             "shapes": {"rounding": 10, "dimInactive": False, "dimStrength": 0.15}},
+    "gauze": {"frost": {"all": 0.62},
+              "blur": {"enabled": True, "size": 12, "passes": 3, "brightness": 0.92,
+                       "contrast": 1.0, "noise": 0.014},
+              "shapes": {"rounding": 6, "dimInactive": False, "dimStrength": 0.15}},
+    "crisp": {"frost": {"all": 0.92},
+              "blur": {"enabled": True, "size": 10, "passes": 2, "brightness": 1.0,
+                       "contrast": 1.03, "noise": 0.006},
+              "shapes": {"rounding": 2, "dimInactive": False, "dimStrength": 0.15}},
+}
+# stock = remove the managed block entirely; omarchy's defaults (0.985 opacity,
+# blur off, sharp corners) resume. It is kept as a preset position for the
+# "Custom" readout, so it must reset every lever it releases: corners go back
+# to rounding 0 / no dim, otherwise the state lies about what the reload did.
+STOCK = {"frost": {"all": 0.985},
+         "blur": {"enabled": False},
+         "shapes": {"rounding": 0, "dimInactive": False, "dimStrength": 0.15}}
+
+# right-click style tour (favorites) — cycles these with a 10s keep-or-revert trial
+TOUR = ["cloud", "smoke", "ink", "crystal", "milky"]
+
+CLASS_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+USER_NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,24}$")
+OPACITY_RE = re.compile(r'opacity\s*=\s*"([0-9.]+)\s+([0-9.]+)"')
+
+
+def acquire_lock() -> int | None:
+    """Serialise concurrent state writers (panel, service IPC, CLI) via flock."""
+    try:
+        os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError:
+        return None
+
+
+def run(cmd: list[str], timeout: float = 4.0) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:  # noqa: BLE001 — report, never crash the panel
+        return 1, str(e)
+
+
+def hypr_eval(expr: str) -> tuple[int, str]:
+    return run(["hyprctl", "eval", expr])
+
+
+def load_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        merged = copy.deepcopy(DEFAULT_STATE)
+        deep_merge(merged, data)
+        # An explicit empty dict/list on disk is meaningful ("no per-app rows")
+        # and deep_merge cannot express it — disk wins wholesale for these keys.
+        df = data.get("frost")
+        if isinstance(df, dict):
+            if isinstance(df.get("apps"), dict):
+                merged["frost"]["apps"] = df["apps"]
+            if isinstance(df.get("keepSolid"), list):
+                merged["frost"]["keepSolid"] = df["keepSolid"]
+        return merged
+    except (OSError, ValueError):
+        return copy.deepcopy(DEFAULT_STATE)
+
+
+def save_state(state: dict) -> None:
+    # the SHAPES corners switch restores from here: remember the last
+    # non-zero radius on every save (rounding 0 never overwrites the memory)
+    r = int((state.get("shapes") or {}).get("rounding", 0) or 0)
+    if r > 0:
+        state["roundingMem"] = r
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_PATH), prefix=".glass.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def deep_merge(base: dict, extra: dict) -> dict:
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def clamp(value, lo, hi):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return lo
+    return max(lo, min(hi, v))
+
+
+def sanitize_preset(value: dict) -> dict:
+    """Clamp a saved preset's frost/blur/shapes through the state sanitizer."""
+    t = sanitize_state(deep_merge(copy.deepcopy(DEFAULT_STATE), value))
+    return {"frost": t["frost"], "blur": t["blur"], "shapes": t["shapes"]}
+
+
+def sanitize_state(state: dict) -> dict:
+    s = copy.deepcopy(state)
+    f = s.get("frost") or {}
+    f["all"] = round(clamp(f.get("all", 0.85), 0.30, 1.0), 3)
+    apps = {}
+    for klass, val in (f.get("apps") or {}).items():
+        if CLASS_RE.match(klass or ""):
+            apps[klass] = round(clamp(val, 0.30, 1.0), 3)
+    f["apps"] = apps
+    f["keepSolid"] = [c for c in (f.get("keepSolid") or []) if CLASS_RE.match(c or "")]
+    s["frost"] = f
+    b = s.get("blur") or {}
+    b["enabled"] = bool(b.get("enabled", True))
+    b["size"] = int(clamp(b.get("size", 14), 0, 24))
+    b["passes"] = int(clamp(b.get("passes", 3), 1, 5))
+    b["brightness"] = round(clamp(b.get("brightness", 1.0), 0.20, 2.0), 3)
+    b["contrast"] = round(clamp(b.get("contrast", 1.0), 0.20, 2.0), 3)
+    b["noise"] = round(clamp(b.get("noise", 0.011), 0.0, 0.10), 3)
+    s["blur"] = b
+    sh = s.get("shapes") or {}
+    sh["rounding"] = int(clamp(sh.get("rounding", 0), 0, 24))
+    sh["dimInactive"] = bool(sh.get("dimInactive", False))
+    sh["dimStrength"] = round(clamp(sh.get("dimStrength", 0.15), 0.0, 0.60), 3)
+    s["shapes"] = sh
+    s["roundingMem"] = int(clamp(s.get("roundingMem", 16), 0, 24))
+    s["bar"] = {"transparent": bool((s.get("bar") or {}).get("transparent", False))}
+    up = {}
+    for name, val in (s.get("userPresets") or {}).items():
+        if (isinstance(val, dict) and USER_NAME_RE.match(name)
+                and name.lower() not in PRESETS and name.lower() != "stock"):
+            up[name] = sanitize_preset(val)
+    s["userPresets"] = up
+    s["version"] = 1
+    return s
+
+
+# ── preset identity ───────────────────────────────────────────────────
+
+def active_preset(state: dict) -> str | None:
+    """Name of the preset the current look matches, or None ("Custom").
+
+    User presets are checked first — a look you saved under your own name
+    keeps that name even if it equals a builtin — then the builtins, then
+    the stock position. While blur is disabled its sub-params (size,
+    passes, ...) are inert and do not break the stock identification.
+    """
+    f, b, sh = state["frost"], state["blur"], state["shapes"]
+    for name in sorted((state.get("userPresets") or {}).keys()):
+        p = state["userPresets"][name]
+        if p["frost"] == f and p["blur"] == b and p["shapes"] == sh:
+            return name
+    for name, preset in PRESETS.items():
+        t = sanitize_state(deep_merge(copy.deepcopy(state), preset))
+        if t["frost"]["all"] == f["all"] and t["blur"] == b and t["shapes"] == sh:
+            return name
+    # stock = omarchy default: blur off, near-solid, sharp corners, no dim
+    if (not b["enabled"] and f["all"] >= 0.98
+            and sh["rounding"] == 0 and not sh["dimInactive"]):
+        return "stock"
+    return None
+
+
+def ok_state(state: dict) -> dict:
+    """Standard ok response: state + active preset + preset name lists."""
+    return {
+        "ok": True,
+        "state": state,
+        "active": active_preset(state),
+        "builtins": list(PRESETS.keys()) + ["stock"],
+        "user": sorted((state.get("userPresets") or {}).keys()),
+        "tour": TOUR,
+    }
+
+
+def sync_state(state: dict) -> int:
+    """Drop every per-app override. Returns how many rules were removed."""
+    f = state.setdefault("frost", {})
+    removed = len(f.get("apps") or {}) + len(f.get("keepSolid") or [])
+    f["apps"] = {}
+    f["keepSolid"] = []
+    return removed
+
+
+def rounding_switch(state: dict, arg: str) -> int | None:
+    """New corner radius for the SHAPES switch. None = invalid arg.
+
+    false → square (0). true → current radius, else the remembered one.
+    toggle → flip between square and the remembered radius.
+    """
+    r = int(state["shapes"].get("rounding", 0))
+    mem = int(state.get("roundingMem", 16) or 16)
+    if arg == "false":
+        return 0
+    if arg == "true":
+        return r if r > 0 else mem
+    if arg == "toggle":
+        return 0 if r > 0 else mem
+    return None
+
+
+def set_user_preset(state: dict, name: str) -> str | None:
+    """Snapshot the current look as a user preset. Returns error text or None."""
+    name = (name or "").strip()
+    if not USER_NAME_RE.match(name):
+        return "preset name must be 1-24 chars: letters, digits, space, _ or -"
+    if name.lower() in PRESETS or name.lower() == "stock":
+        return f"'{name}' is a builtin preset name (case-insensitive)"
+    ups = state.setdefault("userPresets", {})
+    if name not in ups and len(ups) >= 30:
+        return "too many user presets (30 max)"
+    ups[name] = {
+        "frost": copy.deepcopy(state["frost"]),
+        "blur": copy.deepcopy(state["blur"]),
+        "shapes": copy.deepcopy(state["shapes"]),
+    }
+    return None
+
+
+def apply_user_preset(state: dict, name: str) -> dict | None:
+    """Replace frost/blur/shapes with a user preset's exact snapshot."""
+    p = (state.get("userPresets") or {}).get(name)
+    if p is None:
+        return None
+    state["frost"] = copy.deepcopy(p["frost"])
+    state["blur"] = copy.deepcopy(p["blur"])
+    state["shapes"] = copy.deepcopy(p["shapes"])
+    return sanitize_state(state)
+
+
+# ── Lua block generation ──────────────────────────────────────────────
+
+def fmt_num(v: float) -> str:
+    s = f"{float(v):.3f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def gen_block(state: dict) -> str:
+    b, sh, f = state["blur"], state["shapes"], state["frost"]
+    lines = [MANAGED_BEGIN,
+             "hl.config({",
+             "  decoration = {",
+             f"    blur = {{ enabled = {str(b['enabled']).lower()}, size = {int(b['size'])}, "
+             f"passes = {int(b['passes'])},",
+             f"             brightness = {fmt_num(b['brightness'])}, contrast = {fmt_num(b['contrast'])}, "
+             f"noise = {fmt_num(b['noise'])} }},",
+             f"    rounding = {int(sh['rounding'])},",
+             f"    dim_inactive = {str(sh['dimInactive']).lower()},",
+             f"    dim_strength = {fmt_num(sh['dimStrength'])},",
+             "  },",
+             "})",
+             f'o.window(".*", {{ opacity = "{fmt_num(f["all"])} {fmt_num(f["all"])}" }})']
+    for klass in sorted(f["apps"]):
+        v = fmt_num(f["apps"][klass])
+        lines.append(f'o.window({{ class = "{klass}" }}, {{ opacity = "{v} {v}" }})')
+    for klass in sorted(f["keepSolid"]):
+        lines.append(f'o.window({{ class = "{klass}" }}, {{ opacity = "1 1" }})')
+    lines.append(MANAGED_END)
+    return "\n".join(lines)
+
+
+def split_managed(text: str) -> tuple[str, str, str] | None:
+    """Return (pre, inner, post) if both markers present."""
+    if MANAGED_BEGIN not in text or MANAGED_END not in text:
+        return None
+    pre = text.split(MANAGED_BEGIN, 1)[0]
+    inner = text.split(MANAGED_BEGIN, 1)[1].split(MANAGED_END, 1)[0]
+    post = text.split(MANAGED_END, 1)[1]
+    return pre, inner, post
+
+
+def parse_block(text: str, base_state: dict | None = None) -> dict | None:
+    """Parse live values out of a managed block. File wins over state.
+
+    base_state (when given) supplies fields the block does not carry — e.g.
+    userPresets — which must survive a readback.
+    """
+    parts = split_managed(text)
+    if not parts:
+        return None
+    inner = parts[1]
+    state = copy.deepcopy(base_state if base_state is not None else DEFAULT_STATE)
+    m = re.search(r"blur\s*=\s*\{([^}]*)}", inner)
+    if m:
+        blob = m.group(1)
+        state["blur"]["enabled"] = "enabled = true" in blob
+        for key, attr in (("size", "size"), ("passes", "passes")):
+            mm = re.search(rf"\b{attr}\s*=\s*(\d+)", blob)
+            if mm:
+                state["blur"][key] = int(mm.group(1))
+        for key in ("brightness", "contrast", "noise"):
+            mm = re.search(rf"\b{key}\s*=\s*([0-9.]+)", blob)
+            if mm:
+                state["blur"][key] = float(mm.group(1))
+    mm = re.search(r"rounding\s*=\s*(\d+)", inner)
+    if mm:
+        state["shapes"]["rounding"] = int(mm.group(1))
+    state["shapes"]["dimInactive"] = "dim_inactive = true" in inner
+    mm = re.search(r"dim_strength\s*=\s*([0-9.]+)", inner)
+    if mm:
+        state["shapes"]["dimStrength"] = float(mm.group(1))
+    apps, keep = {}, []
+    for mm in OPACITY_RE.finditer(inner):
+        focused, inactive = float(mm.group(1)), float(mm.group(2))
+        # find the class of the rule THIS opacity belongs to: nearest class=
+        # before it, skipping over later o.window( openings is unnecessary
+        # because class= always precedes opacity= inside the same call.
+        ctx = inner[max(0, mm.start() - 160):mm.start()]
+        cm = None
+        for cm2 in re.finditer(r'class\s*=\s*"([^"]+)"', ctx):
+            cm = cm2.group(1)
+        if cm:
+            if focused >= 1.0 and inactive >= 1.0:
+                keep.append(cm)
+            else:
+                apps[cm] = focused
+        else:
+            state["frost"]["all"] = focused
+    state["frost"]["apps"] = apps
+    state["frost"]["keepSolid"] = keep
+    return sanitize_state(state)
+
+
+def write_block(state: dict) -> str:
+    """Backup + splice the managed block into looknfeel.lua. Returns backup path."""
+    text = load_text(LOOKNFEEL)
+    backup = ""
+    if text.strip():
+        backup = f"{LOOKNFEEL}.bak.{int(time.time())}"
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        prune_backups()
+    block = gen_block(state)
+    parts = split_managed(text)
+    if parts:
+        new_text = parts[0].rstrip() + "\n\n" + block + "\n" + parts[2].lstrip("\n")
+    else:
+        new_text = (text.rstrip() + "\n\n" if text.strip() else "") + block + "\n"
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LOOKNFEEL), prefix=".looknfeel.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
+    os.replace(tmp, LOOKNFEEL)
+    return backup
+
+
+def prune_backups(keep: int = 10) -> None:
+    baks = sorted(glob.glob(f"{LOOKNFEEL}.bak.*"))
+    for old in baks[:-keep] if len(baks) > keep else []:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def remove_block() -> str:
+    text = load_text(LOOKNFEEL)
+    parts = split_managed(text)
+    if not parts:
+        return ""
+    backup = f"{LOOKNFEEL}.bak.{int(time.time())}"
+    with open(backup, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    new_text = (parts[0].rstrip() + "\n" if parts[0].strip() else "")
+    if parts[2].strip():
+        new_text += "\n" + parts[2].lstrip("\n")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LOOKNFEEL), prefix=".looknfeel.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
+    os.replace(tmp, LOOKNFEEL)
+    return backup
+
+
+# ── live apply paths ──────────────────────────────────────────────────
+
+def live_expr(state: dict) -> str:
+    b, sh = state["blur"], state["shapes"]
+    return ("hl.config({ decoration = { blur = { "
+            "enabled = %s, size = %d, "
+            "passes = %d, brightness = %s, "
+            "contrast = %s, noise = %s }, "
+            "rounding = %d, dim_inactive = %s, "
+            "dim_strength = %s } })"
+            ) % (
+        str(b["enabled"]).lower(), int(b["size"]),
+        int(b["passes"]), fmt_num(b["brightness"]),
+        fmt_num(b["contrast"]), fmt_num(b["noise"]),
+        int(sh["rounding"]), str(sh["dimInactive"]).lower(),
+        fmt_num(sh["dimStrength"]))
+
+
+def apply_live(state: dict) -> tuple[int, str]:
+    return hypr_eval(live_expr(state))
+
+
+def apply_frost(state: dict) -> tuple[int, str]:
+    backup = write_block(state)
+    code, out = run(["hyprctl", "reload"])
+    if code != 0:
+        return code, f"reload failed: {out}"
+    return 0, backup
+
+
+def apply_bar(transparent: bool) -> None:
+    run(["omarchy", "bar", "transparent", "true" if transparent else "false"])
+
+
+def strip_lua_comments(text: str) -> str:
+    """Drop '--' comment lines so adoption never reads commented templates."""
+    out = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("--"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def adopt_from_file(state: dict) -> dict:
+    """File wins: parse live block; else parse hand-written pre-block lines."""
+    text = load_text(LOOKNFEEL)
+    parsed = parse_block(text, state) if split_managed(text) else None
+    if parsed:
+        return parsed
+    adopted = copy.deepcopy(state)
+    pre = text.split(MANAGED_BEGIN, 1)[0] if MANAGED_BEGIN in text else text
+    pre = strip_lua_comments(pre)
+    # hand-written blur config (migration source)
+    mm = re.search(r"blur\s*=\s*\{([^}]*)}", pre)
+    if mm:
+        blob = mm.group(1)
+        adopted["blur"]["enabled"] = "enabled = true" in blob
+        for key in ("size", "passes"):
+            m2 = re.search(rf"\b{key}\s*=\s*(\d+)", blob)
+            if m2:
+                adopted["blur"][key] = int(m2.group(1))
+        for key in ("brightness", "contrast", "noise"):
+            m2 = re.search(rf"\b{key}\s*=\s*([0-9.]+)", blob)
+            if m2:
+                adopted["blur"][key] = float(m2.group(1))
+    mm = re.search(r"rounding\s*=\s*(\d+)", pre)
+    if mm:
+        adopted["shapes"]["rounding"] = int(mm.group(1))
+    # hand-written opacity rules
+    apps = {}
+    all_v = None
+    for m2 in OPACITY_RE.finditer(pre):
+        ctx = pre[max(0, m2.start() - 160):m2.start()]
+        cm = None
+        for cm2 in re.finditer(r'class\s*=\s*"([^"]+)"', ctx):
+            cm = cm2.group(1)
+        if cm:
+            apps[cm] = float(m2.group(1))
+        elif all_v is None:
+            all_v = float(m2.group(1))
+    if all_v is not None:
+        adopted["frost"]["all"] = all_v
+    if apps:
+        adopted["frost"]["apps"] = apps
+    return sanitize_state(adopted)
+
+
+def cmd_init() -> int:
+    state = adopt_from_file(load_state())
+    text = load_text(LOOKNFEEL)
+    if not split_managed(text):
+        # First run: strip the hand-written glass lines, then splice the block.
+        backup = f"{LOOKNFEEL}.bak.{int(time.time())}"
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        legacy_cut = cut_legacy_glass_section(text)
+        block = gen_block(state)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LOOKNFEEL), prefix=".looknfeel.")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(legacy_cut.rstrip() + "\n\n" + block + "\n")
+        os.replace(tmp, LOOKNFEEL)
+    save_state(state)
+    print(json.dumps(ok_state(state)))
+    return 0
+
+
+def cut_legacy_glass_section(text: str) -> str:
+    """Remove hand-written milky-glass blur/opacity lines (keep everything else)."""
+    marker = "-- Milky glass"
+    idx = text.find(marker)
+    if idx == -1:
+        # fall back: whole tail scan for standalone blur/opacity statements
+        return text
+    return text[:idx].rstrip() + "\n"
+
+
+# ── commands ──────────────────────────────────────────────────────────
+
+def cmd_get() -> int:
+    print(json.dumps(ok_state(load_state())))
+    return 0
+
+
+def cmd_readback() -> int:
+    print(json.dumps(ok_state(adopt_from_file(load_state()))))
+    return 0
+
+
+def cmd_set(payload: str) -> int:
+    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    save_state(state)
+    code, out = apply_live(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": f"live apply rejected: {out.strip()}"}))
+        return 1
+    code, out = apply_frost(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    if "bar" in (payload and json.loads(payload) or {}):
+        apply_bar(state["bar"]["transparent"])
+    print(json.dumps(ok_state(state)))
+    return 0
+
+
+def cmd_live(payload: str) -> int:
+    """Drag ticks: live-apply blur/shapes only. No writes."""
+    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    code, out = apply_live(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    print(json.dumps({"ok": True}))
+    return 0
+
+
+def cmd_frost(payload: str) -> int:
+    """Slider release: persist + block rewrite + reload."""
+    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    save_state(state)
+    code, out = apply_frost(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    print(json.dumps(ok_state(state)))
+    return 0
+
+
+def cmd_persist(payload: str) -> int:
+    """Blur/shapes release: persist + block rewrite, NO reload (the change is
+    already live; the block keeps it across the next reload)."""
+    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    save_state(state)
+    write_block(state)
+    code, out = apply_live(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    print(json.dumps(ok_state(state)))
+    return 0
+
+
+def cmd_preset(name: str) -> int:
+    name = (name or "").strip()
+    if name == "stock":
+        backup = remove_block()
+        state = sanitize_state(deep_merge(load_state(), STOCK))
+        sync_state(state)  # the removed block carried the per-app rules
+        save_state(state)
+        run(["hyprctl", "reload"])
+        res = ok_state(state)
+        res["backup"] = backup
+        res["note"] = "Stock — omarchy defaults restored"
+        print(json.dumps(res))
+        return 0
+    state = sanitize_state(load_state())
+    if name in PRESETS:
+        state = sanitize_state(deep_merge(state, PRESETS[name]))
+    elif name in (state.get("userPresets") or {}):
+        state = apply_user_preset(state, name)
+    else:
+        print(json.dumps({"ok": False, "error": f"unknown preset '{name}'"}))
+        return 1
+    save_state(state)
+    code, _ = apply_live(state)
+    code, out = apply_frost(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    print(json.dumps(ok_state(state)))
+    return 0
+
+
+def cmd_savepreset(name: str) -> int:
+    state = sanitize_state(load_state())
+    err = set_user_preset(state, name)
+    if err:
+        print(json.dumps({"ok": False, "error": err}))
+        return 1
+    save_state(state)
+    res = ok_state(state)
+    res["note"] = f"Saved preset '{name.strip()}'"
+    print(json.dumps(res))
+    return 0
+
+
+def cmd_delpreset(name: str) -> int:
+    state = sanitize_state(load_state())
+    ups = state.get("userPresets") or {}
+    if name not in ups:
+        print(json.dumps({"ok": False, "error": f"no user preset '{name}'"}))
+        return 1
+    del ups[name]
+    save_state(state)
+    res = ok_state(state)
+    res["note"] = f"Deleted preset '{name}'"
+    print(json.dumps(res))
+    return 0
+
+
+def cmd_sync() -> int:
+    state = sanitize_state(load_state())
+    removed = sync_state(state)
+    save_state(state)
+    code, out = apply_frost(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    res = ok_state(state)
+    res["removed"] = removed
+    res["note"] = (f"Synced — removed {removed} per-app rule(s); "
+                   "every window follows All apps" if removed
+                   else "Nothing to sync — no per-app rules")
+    print(json.dumps(res))
+    return 0
+
+
+def cmd_round(arg: str) -> int:
+    """SHAPES corners switch: persist + block rewrite + live apply (no reload)."""
+    if arg not in ("true", "false", "toggle"):
+        print(json.dumps({"ok": False, "error": "expected true|false|toggle"}))
+        return 1
+    state = sanitize_state(load_state())
+    new = rounding_switch(state, arg)
+    if new == 0 and state["shapes"]["rounding"] > 0:
+        state["roundingMem"] = state["shapes"]["rounding"]  # pin before squaring
+    state["shapes"]["rounding"] = new
+    save_state(state)
+    write_block(state)
+    code, out = apply_live(state)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    res = ok_state(state)
+    res["rounded"] = new > 0
+    res["note"] = ("Corners: rounded (" + str(new) + ")" if new > 0 else "Corners: square")
+    print(json.dumps(res))
+    return 0
+
+
+def cmd_revert() -> int:
+    baks = sorted(glob.glob(f"{LOOKNFEEL}.bak.*"))
+    if not baks:
+        print(json.dumps({"ok": False, "error": "no backup found"}))
+        return 1
+    newest = baks[-1]
+    with open(newest, encoding="utf-8") as fh:
+        text = fh.read()
+    with open(LOOKNFEEL, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    run(["hyprctl", "reload"])
+    parsed = parse_block(text, load_state()) if split_managed(text) else None
+    if parsed:
+        save_state(parsed)
+    res = ok_state(parsed if parsed else load_state())
+    res["restored"] = newest
+    print(json.dumps(res))
+    return 0
+
+
+def cmd_classes() -> int:
+    code, out = run(["hyprctl", "clients", "-j"])
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    classes = sorted({c.get("class", "") for c in json.loads(out) if c.get("class")})
+    print(json.dumps({"ok": True, "classes": classes}))
+    return 0
+
+
+def cmd_bar(arg: str) -> int:
+    if arg not in ("true", "false", "toggle"):
+        print(json.dumps({"ok": False, "error": "expected true|false|toggle"}))
+        return 1
+    code, out = run(["omarchy", "bar", "transparent", arg])
+    if code != 0:
+        print(json.dumps({"ok": False, "error": out.strip()}))
+        return 1
+    state = load_state()
+    state["bar"]["transparent"] = (arg == "true") or (
+        arg == "toggle" and not state["bar"]["transparent"])
+    save_state(state)
+    res = ok_state(state)
+    res["transparent"] = state["bar"]["transparent"]
+    print(json.dumps(res))
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return 2
+    cmd, payload = args[0], " ".join(args[1:])
+    _lock_fd = acquire_lock()  # held until exit; serialises concurrent writers
+    table = {
+        "init": cmd_init, "migrate": cmd_init,
+        "get": cmd_get,
+        "readback": cmd_readback,
+        "presets": cmd_readback,
+        "set": lambda: cmd_set(payload),
+        "live": lambda: cmd_live(payload),
+        "frost": lambda: cmd_frost(payload),
+        "persist": lambda: cmd_persist(payload),
+        "preset": lambda: cmd_preset(payload.strip()),
+        "savepreset": lambda: cmd_savepreset(payload.strip()),
+        "delpreset": lambda: cmd_delpreset(payload.strip()),
+        "sync": cmd_sync,
+        "round": lambda: cmd_round(payload.strip()),
+        "revert": cmd_revert,
+        "classes": cmd_classes,
+        "bar": lambda: cmd_bar(payload.strip()),
+    }
+    if cmd not in table:
+        print(json.dumps({"ok": False, "error": f"unknown command {cmd}"}))
+        return 2
+    return table[cmd]()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

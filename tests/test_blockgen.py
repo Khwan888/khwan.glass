@@ -90,48 +90,50 @@ check("dimStrength clamped 0.60", s4["shapes"]["dimStrength"] == 0.60)
 
 # ── 5. splice into a copy of the REAL looknfeel.lua ───────────────────
 real = os.path.expanduser("~/.config/hypr/looknfeel.lua")
-real_text = open(real, encoding="utf-8").read()
-# reconstruct the pre-managed state: strip any live managed block the way
-# remove_block does, so this test works whether or not the real file is managed
-if g.split_managed(real_text):
-    _pre, _inner, _post = g.split_managed(real_text)
-    real_text = (_pre.rstrip() + "\n" if _pre.strip() else "")
-    if _post.strip():
-        real_text += "\n" + _post.lstrip("\n")
-with tempfile.TemporaryDirectory() as td:
-    # deterministic adoption source: seed a state file instead of the live one
-    _state_orig, _look_orig = g.STATE_PATH, g.LOOKNFEEL
-    g.STATE_PATH = os.path.join(td, "glass.json")
-    g.save_state(g.sanitize_state(g.deep_merge(
-        g.copy.deepcopy(g.DEFAULT_STATE),
-        {"frost": {"apps": {"com.nousresearch.hermes": 0.82}}})))
-    lf = os.path.join(td, "looknfeel.lua")
-    open(lf, "w").write(real_text)
-    g.LOOKNFEEL = lf
-    # simulate init on real file: adopt → cut legacy → splice
-    adopted = g.adopt_from_file(g.load_state())
-    cut = g.cut_legacy_glass_section(real_text)
-    block5 = g.gen_block(adopted)
-    open(lf, "w").write(cut.rstrip() + "\n\n" + block5 + "\n")
-    text5 = open(lf).read()
-    parts = g.split_managed(text5)
-    check("real file: block spliced", parts is not None)
-    check("real file: legacy section gone", "-- Milky glass" not in text5)
-    check("real file: commented template intact",
-          "-- Change the default Omarchy look'n'feel." in text5)
-    check("real file: adopted hermes 0.82",
-          parts and 'opacity = "0.82 0.82"' in parts[1], parts[1] if parts else "")
-    # second splice replaces in place
-    g.write_block(adopted)
-    text5b = open(lf).read()
-    check("real file: second write replaces", text5b.count(g.MANAGED_BEGIN) == 1)
-    # readback on the temp file keeps userPresets from the base state
-    base5 = g.load_state()
-    base5["userPresets"] = {"My Look": g.sanitize_preset({"blur": {"size": 20}})}
-    rb5 = g.parse_block(open(lf).read(), base5)
-    check("readback keeps userPresets", rb5 and "My Look" in rb5["userPresets"],
-          str(rb5["userPresets"]) if rb5 else "None")
-    g.STATE_PATH, g.LOOKNFEEL = _state_orig, _look_orig
+if not os.path.exists(real):
+    print("  skip  real-file splice (no ~/.config/hypr/looknfeel.lua)")
+else:
+    real_text = open(real, encoding="utf-8").read()
+    # reconstruct the pre-managed state: strip any live managed block the way
+    # remove_block does, so this test works whether or not the real file is managed
+    if g.split_managed(real_text):
+        _pre, _inner, _post = g.split_managed(real_text)
+        real_text = (_pre.rstrip() + "\n" if _pre.strip() else "")
+        if _post.strip():
+            real_text += "\n" + _post.lstrip("\n")
+    with tempfile.TemporaryDirectory() as td:
+        # deterministic adoption source: seed a state file instead of the live one
+        _state_orig, _look_orig = g.STATE_PATH, g.LOOKNFEEL
+        g.STATE_PATH = os.path.join(td, "glass.json")
+        g.save_state(g.sanitize_state(g.deep_merge(
+            g.copy.deepcopy(g.DEFAULT_STATE),
+            {"frost": {"apps": {"com.nousresearch.hermes": 0.82}}})))
+        lf = os.path.join(td, "looknfeel.lua")
+        open(lf, "w").write(real_text)
+        g.LOOKNFEEL = lf
+        # init adopts but never writes (consent model — see §13)
+        g.cmd_init()
+        check("real file: init leaves it untouched", open(lf).read() == real_text)
+        # first user-initiated write creates the managed block
+        g.write_block(g.load_state())
+        text5 = open(lf).read()
+        parts = g.split_managed(text5)
+        check("real file: block spliced", parts is not None)
+        check("real file: commented template intact",
+              "-- Change the default Omarchy look'n'feel." in text5)
+        check("real file: adopted hermes 0.82",
+              parts and 'opacity = "0.82 0.82"' in parts[1], parts[1] if parts else "")
+        # second write replaces in place
+        g.write_block(g.load_state())
+        text5b = open(lf).read()
+        check("real file: second write replaces", text5b.count(g.MANAGED_BEGIN) == 1)
+        # readback on the temp file keeps userPresets from the base state
+        base5 = g.load_state()
+        base5["userPresets"] = {"My Look": g.sanitize_preset({"blur": {"size": 20}})}
+        rb5 = g.parse_block(open(lf).read(), base5)
+        check("readback keeps userPresets", rb5 and "My Look" in rb5["userPresets"],
+              str(rb5["userPresets"]) if rb5 else "None")
+        g.STATE_PATH, g.LOOKNFEEL = _state_orig, _look_orig
 
 # ── 6. all 9 applyable presets generate + parse + identify ────────────
 for name in ("milky", "cloud", "frosted", "smoke", "ink", "crystal", "veil", "gauze", "crisp"):
@@ -270,6 +272,99 @@ with tempfile.TemporaryDirectory() as td11:
     st11c = g.load_state()
     check("missing file → defaults (no rows)",
           st11c["frost"]["apps"] == {} and st11c["frost"]["all"] == 0.85)
+
+# ── 13. consent model: init is read-only ──────────────────────────────
+LEGACY = """-- Change the default Omarchy look'n'feel.
+-- Milky glass
+hl.config({
+  decoration = {
+    blur = { enabled = true, size = 14, passes = 3, brightness = 1, contrast = 1, noise = 0.011 },
+    rounding = 0,
+    dim_inactive = false,
+    dim_strength = 0.15,
+  },
+})
+o.window(".*", { opacity = "0.85 0.85" })
+"""
+with tempfile.TemporaryDirectory() as td13:
+    _sp13, _lk13 = g.STATE_PATH, g.LOOKNFEEL
+    g.STATE_PATH = os.path.join(td13, "glass.json")
+    lf = os.path.join(td13, "looknfeel.lua")
+    open(lf, "w").write(LEGACY)
+    g.LOOKNFEEL = lf
+    before13 = open(lf).read()
+    rc13 = g.cmd_init()
+    check("consent: init exit 0", rc13 == 0)
+    check("consent: init leaves looknfeel byte-identical", open(lf).read() == before13)
+    check("consent: init writes no backup", not g.glob.glob(lf + ".bak.*"))
+    st13 = g.load_state()
+    check("consent: init adopts hand-written values",
+          st13["blur"]["size"] == 14 and st13["frost"]["all"] == 0.85,
+          str(st13["blur"]) + str(st13["frost"]))
+    g.STATE_PATH, g.LOOKNFEEL = _sp13, _lk13
+
+# ── 14. guarded legacy trim: pure glass tail trims at first write ─────
+with tempfile.TemporaryDirectory() as td14:
+    _sp14, _lk14 = g.STATE_PATH, g.LOOKNFEEL
+    g.STATE_PATH = os.path.join(td14, "glass.json")
+    lf = os.path.join(td14, "looknfeel.lua")
+    open(lf, "w").write(LEGACY)
+    g.LOOKNFEEL = lf
+    g.write_block(g.load_state())
+    text14 = open(lf).read()
+    check("trim: legacy marker gone after first write", "-- Milky glass" not in text14)
+    check("trim: omarchy header comment kept",
+          "-- Change the default Omarchy look'n'feel." in text14)
+    check("trim: block spliced", g.split_managed(text14) is not None)
+    check("trim: one backup taken", len(g.glob.glob(lf + ".bak.*")) == 1)
+    g.STATE_PATH, g.LOOKNFEEL = _sp14, _lk14
+
+# ── 15. guarded legacy trim: mixed tails survive ──────────────────────
+MIXED = LEGACY + 'hl.env("EDITOR", "nvim")\n'
+check("trim: mixed tail not trimmed (unit)",
+      g.trim_legacy_glass_section(MIXED) == MIXED)
+check("trim: no marker → unchanged (unit)",
+      g.trim_legacy_glass_section("hl.config({})\n") == "hl.config({})\n")
+with tempfile.TemporaryDirectory() as td15:
+    _sp15, _lk15 = g.STATE_PATH, g.LOOKNFEEL
+    g.STATE_PATH = os.path.join(td15, "glass.json")
+    lf = os.path.join(td15, "looknfeel.lua")
+    open(lf, "w").write(MIXED)
+    g.LOOKNFEEL = lf
+    g.write_block(g.load_state())
+    text15 = open(lf).read()
+    check("trim: mixed tail survives first write",
+          "-- Milky glass" in text15 and 'hl.env("EDITOR", "nvim")' in text15)
+    check("trim: block appended after intact tail", g.split_managed(text15) is not None)
+    g.STATE_PATH, g.LOOKNFEEL = _sp15, _lk15
+
+# ── 16. stock no-op + write guards never create looknfeel.lua ─────────
+with tempfile.TemporaryDirectory() as td16:
+    _sp16, _lk16 = g.STATE_PATH, g.LOOKNFEEL
+    g.STATE_PATH = os.path.join(td16, "glass.json")
+    lf = os.path.join(td16, "looknfeel.lua")
+    open(lf, "w").write("-- plain file\n")
+    g.LOOKNFEEL = lf
+    before16 = open(lf).read()
+    check("stock-noop: remove_block empty on unmanaged file", g.remove_block() == "")
+    check("stock-noop: file untouched", open(lf).read() == before16)
+    missing = os.path.join(td16, "nope", "looknfeel.lua")
+    g.LOOKNFEEL = missing
+    try:
+        g.write_block(g.load_state())
+        check("missing-file: write raises CtlError", False)
+    except g.CtlError as e:
+        check("missing-file: write raises CtlError", "looknfeel.lua" in str(e), str(e))
+    check("missing-file: nothing created", not os.path.exists(missing))
+    fresh = os.path.join(td16, "fresh.lua")
+    g.LOOKNFEEL = fresh
+    try:
+        g.write_block(g.load_state())
+        check("missing-file (dir ok): write raises CtlError", False)
+    except g.CtlError:
+        check("missing-file (dir ok): write raises CtlError", True)
+    check("missing-file (dir ok): nothing created", not os.path.exists(fresh))
+    g.STATE_PATH, g.LOOKNFEEL = _sp16, _lk16
 
 print()
 if failures:

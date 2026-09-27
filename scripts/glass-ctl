@@ -16,9 +16,10 @@ Commands:
   round true|false|toggle
                       window corners: false = square, true = on (last radius)
   classes             list candidate window classes (for "add app" picker)
-  migrate             first-run adoption of hand-written glass settings
+  migrate             alias of init
   revert              restore newest looknfeel.lua.bak.* and reload
-  init                adopt-or-default; called by the service at startup
+  init                adopt current settings into state (read-only; never
+                      writes looknfeel.lua)
 
 State:  ~/.local/state/omarchy/glass.json
 Block:  ~/.config/hypr/looknfeel.lua between BEGIN/END khwan.glass markers
@@ -117,6 +118,10 @@ TOUR = ["cloud", "smoke", "ink", "crystal", "milky"]
 CLASS_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 USER_NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,24}$")
 OPACITY_RE = re.compile(r'opacity\s*=\s*"([0-9.]+)\s+([0-9.]+)"')
+
+
+class CtlError(Exception):
+    """User-facing failure; main() turns it into {"ok": false, "error": ...}."""
 
 
 def acquire_lock() -> int | None:
@@ -429,7 +434,14 @@ def parse_block(text: str, base_state: dict | None = None) -> dict | None:
 
 
 def write_block(state: dict) -> str:
-    """Backup + splice the managed block into looknfeel.lua. Returns backup path."""
+    """Backup + splice the managed block into looknfeel.lua. Returns backup path.
+
+    The ONLY path that creates the block, and only on a user-initiated change
+    (never at init/startup — consent model, docs/adr/0002). Glass never
+    creates looknfeel.lua if it is absent.
+    """
+    if not os.path.isfile(LOOKNFEEL):
+        raise CtlError(f"{LOOKNFEEL} not found — Glass never creates it; nothing to write")
     text = load_text(LOOKNFEEL)
     backup = ""
     if text.strip():
@@ -442,7 +454,8 @@ def write_block(state: dict) -> str:
     if parts:
         new_text = parts[0].rstrip() + "\n\n" + block + "\n" + parts[2].lstrip("\n")
     else:
-        new_text = (text.rstrip() + "\n\n" if text.strip() else "") + block + "\n"
+        base = trim_legacy_glass_section(text)
+        new_text = (base.rstrip() + "\n\n" if base.strip() else "") + block + "\n"
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LOOKNFEEL), prefix=".looknfeel.")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(new_text)
@@ -522,6 +535,37 @@ def strip_lua_comments(text: str) -> str:
     return "\n".join(out)
 
 
+# words a hand-written "milky glass" tail may contain if it is safe to trim
+# (trim_legacy_glass_section): anything else after the marker keeps the file
+# byte-intact instead.
+GLASS_TAIL_WORDS = {
+    "hl.config", "decoration", "blur", "enabled", "size", "passes",
+    "brightness", "contrast", "noise", "rounding", "dim_inactive",
+    "dim_strength", "o.window", "opacity", "class", "true", "false",
+}
+
+
+def tail_is_glass_only(tail: str) -> bool:
+    """True when the only Lua words in tail are glass constructs. Quoted
+    strings (class names, opacity pairs) are blanked first, so their content
+    never counts."""
+    body = strip_lua_comments(tail)
+    body = re.sub(r'"[^"]*"', '""', body)
+    body = re.sub(r"'[^']*'", "''", body)
+    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", body)) <= GLASS_TAIL_WORDS
+
+
+def trim_legacy_glass_section(text: str) -> str:
+    """Trim a hand-written milky-glass tail only when everything after the
+    `-- Milky glass` marker is glass-related lines; otherwise return the text
+    unchanged (the marker is a guess — unrelated content must survive)."""
+    marker = "-- Milky glass"
+    idx = text.find(marker)
+    if idx == -1 or not tail_is_glass_only(text[idx:]):
+        return text
+    return text[:idx].rstrip() + "\n"
+
+
 def adopt_from_file(state: dict) -> dict:
     """File wins: parse live block; else parse hand-written pre-block lines."""
     text = load_text(LOOKNFEEL)
@@ -567,32 +611,13 @@ def adopt_from_file(state: dict) -> dict:
 
 
 def cmd_init() -> int:
+    """Adopt current settings into the state file. READ-ONLY for
+    looknfeel.lua: the managed block is created or updated only by a
+    user-initiated write (write_block). Consent model: docs/adr/0002."""
     state = adopt_from_file(load_state())
-    text = load_text(LOOKNFEEL)
-    if not split_managed(text):
-        # First run: strip the hand-written glass lines, then splice the block.
-        backup = f"{LOOKNFEEL}.bak.{int(time.time())}"
-        with open(backup, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        legacy_cut = cut_legacy_glass_section(text)
-        block = gen_block(state)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LOOKNFEEL), prefix=".looknfeel.")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(legacy_cut.rstrip() + "\n\n" + block + "\n")
-        os.replace(tmp, LOOKNFEEL)
     save_state(state)
     print(json.dumps(ok_state(state)))
     return 0
-
-
-def cut_legacy_glass_section(text: str) -> str:
-    """Remove hand-written milky-glass blur/opacity lines (keep everything else)."""
-    marker = "-- Milky glass"
-    idx = text.find(marker)
-    if idx == -1:
-        # fall back: whole tail scan for standalone blur/opacity statements
-        return text
-    return text[:idx].rstrip() + "\n"
 
 
 # ── commands ──────────────────────────────────────────────────────────
@@ -835,7 +860,14 @@ def main() -> int:
     if cmd not in table:
         print(json.dumps({"ok": False, "error": f"unknown command {cmd}"}))
         return 2
-    return table[cmd]()
+    try:
+        return table[cmd]()
+    except CtlError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 1
+    except OSError as e:
+        print(json.dumps({"ok": False, "error": f"os error: {e}"}))
+        return 1
 
 
 if __name__ == "__main__":

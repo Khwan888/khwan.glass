@@ -27,11 +27,13 @@ Block:  ~/.config/hypr/looknfeel.lua between BEGIN/END khwan.glass markers
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import glob
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,6 +45,8 @@ LOCK_PATH = os.path.join(HOME, ".local/state/omarchy/glass.lock")
 LOOKNFEEL = os.path.join(HOME, ".config/hypr/looknfeel.lua")
 MANAGED_BEGIN = "-- BEGIN khwan.glass (managed by the Glass bar panel — edits are overwritten; use the panel)"
 MANAGED_END = "-- END khwan.glass"
+# review finding 2026-09-28: bound reads — looknfeel.lua is a ~2 KB file
+LOOKNFEEL_MAX_BYTES = 1 << 20  # 1 MiB
 
 DEFAULT_STATE = {
     "version": 1,
@@ -56,6 +60,7 @@ DEFAULT_STATE = {
     # last non-zero corner radius — the SHAPES corners switch restores this
     "roundingMem": 16,
     "userPresets": {},
+    "backups": [],  # ledger of backups Glass created — prune deletes only these
 }
 
 # The 10-style set: light / dark / sheer / sheer-readable /
@@ -147,12 +152,77 @@ def hypr_eval(expr: str) -> tuple[int, str]:
     return run(["hyprctl", "eval", expr])
 
 
-def load_text(path: str) -> str:
+def _backup_name_ok(path: str) -> bool:
+    """True only for the backup names Glass itself creates:
+    <looknfeel.lua>.bak.<epoch> or .bak.<epoch>.<n>."""
+    return bool(re.match(r"^" + re.escape(LOOKNFEEL) + r"\.bak\.\d+(?:\.\d+)?$",
+                         path or ""))
+
+
+def _is_regular_nofollow(path: str) -> bool:
     try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
+        return stat.S_ISREG(os.lstat(path).st_mode)
     except OSError:
+        return False
+
+
+def _require_regular(path: str) -> None:
+    """Refuse anything that is not a plain file — symlink, FIFO, dir."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        raise CtlError(f"{path} not found")
+    if not stat.S_ISREG(st.st_mode):
+        raise CtlError(f"refusing to touch {path}: not a regular file "
+                       "(Glass never follows symlinks or special files)")
+
+
+def _atomic_replace(path: str, text: str) -> None:
+    """Same-dir temp + os.replace: never follows a symlink at path and never
+    leaves a partial file (review finding 2026-09-28)."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".looknfeel.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_text(path: str) -> str:
+    """Read a text file refusing symlinks, non-regular files and absurd
+    sizes (review finding 2026-09-28: reads used to follow any pathname and
+    slurp it whole). A missing file returns "" — callers treat absence as
+    "no content", and Glass never creates looknfeel.lua itself."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
         return ""
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise CtlError(f"refusing to read {path}: is a symlink — "
+                           "Glass never follows symlinks") from e
+        raise CtlError(f"refusing to read {path}: {e.strerror or e}") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CtlError(f"refusing to read {path}: not a regular file "
+                           "(Glass never follows symlinks or special files)")
+        if st.st_size > LOOKNFEEL_MAX_BYTES:
+            raise CtlError(f"refusing to read {path}: file larger than "
+                           f"{LOOKNFEEL_MAX_BYTES} bytes")
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = -1
+            return fh.read()
+    except UnicodeDecodeError as e:
+        raise CtlError(f"refusing to read {path}: not valid UTF-8") from e
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def load_state() -> dict:
@@ -243,6 +313,8 @@ def sanitize_state(state: dict) -> dict:
                 and name.lower() not in PRESETS and name.lower() != "stock"):
             up[name] = sanitize_preset(val)
     s["userPresets"] = up
+    s["backups"] = [p for p in (s.get("backups") or [])
+                    if isinstance(p, str) and _backup_name_ok(p)][-20:]
     s["version"] = 1
     return s
 
@@ -438,17 +510,17 @@ def write_block(state: dict) -> str:
 
     The ONLY path that creates the block, and only on a user-initiated change
     (never at init/startup — consent model, docs/adr/0002). Glass never
-    creates looknfeel.lua if it is absent.
+    creates looknfeel.lua if it is absent, never follows a symlink, and
+    backs up through O_EXCL (review finding 2026-09-28).
     """
-    if not os.path.isfile(LOOKNFEEL):
+    if not os.path.exists(LOOKNFEEL):
         raise CtlError(f"{LOOKNFEEL} not found — Glass never creates it; nothing to write")
+    _require_regular(LOOKNFEEL)
     text = load_text(LOOKNFEEL)
     backup = ""
     if text.strip():
-        backup = f"{LOOKNFEEL}.bak.{int(time.time())}"
-        with open(backup, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        prune_backups()
+        backup = make_backup(text, state)
+        prune_backups(state)
     block = gen_block(state)
     parts = split_managed(text)
     if parts:
@@ -456,37 +528,74 @@ def write_block(state: dict) -> str:
     else:
         base = trim_legacy_glass_section(text)
         new_text = (base.rstrip() + "\n\n" if base.strip() else "") + block + "\n"
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LOOKNFEEL), prefix=".looknfeel.")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp, LOOKNFEEL)
+    _atomic_replace(LOOKNFEEL, new_text)
+    if backup:
+        save_state(state)  # persist the backup ledger
     return backup
 
 
-def prune_backups(keep: int = 10) -> None:
-    baks = sorted(glob.glob(f"{LOOKNFEEL}.bak.*"))
-    for old in baks[:-keep] if len(baks) > keep else []:
+def make_backup(text: str, state: dict) -> str:
+    """Write `text` to a NEW backup file. O_EXCL + O_NOFOLLOW: an existing
+    file, symlink or FIFO at a candidate name is never truncated, followed
+    or blocked on — the name gets a numeric suffix instead (review finding
+    2026-09-28: the old code open(..., "w")ed a predictable
+    second-resolution name). Every backup created is recorded in the state
+    ledger; prune only ever deletes ledger entries."""
+    base = f"{LOOKNFEEL}.bak.{int(time.time())}"
+    for i in range(1000):
+        cand = base if i == 0 else f"{base}.{i}"
         try:
-            os.remove(old)
-        except OSError:
-            pass
+            fd = os.open(cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except BaseException:
+            try:
+                os.unlink(cand)
+            except OSError:
+                pass
+            raise
+        state.setdefault("backups", []).append(cand)
+        return cand
+    raise CtlError("could not create a backup: 1000 name collisions")
 
 
-def remove_block() -> str:
+def prune_backups(state: dict, keep: int = 10) -> None:
+    """Drop old Glass-created backups. Deletes ONLY paths recorded in the
+    ledger — never a blind glob of the pattern (review finding 2026-09-28:
+    the old glob deleted files Glass could not prove it created)."""
+    led = [p for p in (state.get("backups") or [])
+           if isinstance(p, str) and _backup_name_ok(p)]
+    alive = [p for p in led if _is_regular_nofollow(p)]
+    if len(alive) > keep:
+        for old in alive[:-keep]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        alive = alive[-keep:]
+    state["backups"] = alive
+
+
+def remove_block(state: dict | None = None) -> str:
+    if not os.path.exists(LOOKNFEEL):
+        return ""
+    _require_regular(LOOKNFEEL)
     text = load_text(LOOKNFEEL)
     parts = split_managed(text)
     if not parts:
         return ""
-    backup = f"{LOOKNFEEL}.bak.{int(time.time())}"
-    with open(backup, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    st = state if state is not None else load_state()
+    backup = make_backup(text, st)
+    prune_backups(st)
     new_text = (parts[0].rstrip() + "\n" if parts[0].strip() else "")
     if parts[2].strip():
         new_text += "\n" + parts[2].lstrip("\n")
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LOOKNFEEL), prefix=".looknfeel.")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp, LOOKNFEEL)
+    _atomic_replace(LOOKNFEEL, new_text)
+    save_state(st)  # persist the backup ledger
     return backup
 
 
@@ -689,9 +798,9 @@ def cmd_persist(payload: str) -> int:
 def cmd_preset(name: str) -> int:
     name = (name or "").strip()
     if name == "stock":
-        backup = remove_block()
         state = sanitize_state(deep_merge(load_state(), STOCK))
         sync_state(state)  # the removed block carried the per-app rules
+        backup = remove_block(state)
         save_state(state)
         run(["hyprctl", "reload"])
         res = ok_state(state)
@@ -785,15 +894,18 @@ def cmd_round(arg: str) -> int:
 
 
 def cmd_revert() -> int:
-    baks = sorted(glob.glob(f"{LOOKNFEEL}.bak.*"))
+    baks = sorted(
+        (p for p in glob.glob(f"{LOOKNFEEL}.bak.*")
+         if _backup_name_ok(p) and _is_regular_nofollow(p)),
+        key=lambda p: tuple(int(x) for x in re.findall(r"\d+", p.rsplit(".bak.", 1)[1])))
     if not baks:
         print(json.dumps({"ok": False, "error": "no backup found"}))
         return 1
     newest = baks[-1]
-    with open(newest, encoding="utf-8") as fh:
-        text = fh.read()
-    with open(LOOKNFEEL, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    text = load_text(newest)
+    if os.path.exists(LOOKNFEEL):
+        _require_regular(LOOKNFEEL)
+    _atomic_replace(LOOKNFEEL, text)
     run(["hyprctl", "reload"])
     parsed = parse_block(text, load_state()) if split_managed(text) else None
     if parsed:

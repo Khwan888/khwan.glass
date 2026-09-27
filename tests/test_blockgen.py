@@ -366,6 +366,112 @@ with tempfile.TemporaryDirectory() as td16:
     check("missing-file (dir ok): nothing created", not os.path.exists(fresh))
     g.STATE_PATH, g.LOOKNFEEL = _sp16, _lk16
 
+# ── 17. backup hygiene (review 2026-09-28): never truncate, never follow ──
+with tempfile.TemporaryDirectory() as td17:
+    _sp17, _lk17, _tm17 = g.STATE_PATH, g.LOOKNFEEL, g.time.time
+    g.STATE_PATH = os.path.join(td17, "glass.json")
+    lf = os.path.join(td17, "looknfeel.lua")
+    open(lf, "w").write(LEGACY)
+    g.LOOKNFEEL = lf
+    g.time.time = lambda: 1700000000
+    victim = os.path.join(td17, "victim.txt")
+    open(victim, "w").write("VICTIM")
+    os.symlink(victim, f"{lf}.bak.1700000000")          # colliding symlink
+    st17 = g.sanitize_state(g.copy.deepcopy(g.DEFAULT_STATE))
+    bak17 = g.write_block(st17)
+    check("backup: colliding symlink not used", bak17 != f"{lf}.bak.1700000000", bak17)
+    check("backup: victim not truncated", open(victim).read() == "VICTIM")
+    check("backup: colliding symlink still present", os.path.islink(f"{lf}.bak.1700000000"))
+    check("backup: content is pre-write text", open(bak17).read() == LEGACY)
+    check("backup: name is .bak.<t>.N", bak17 == f"{lf}.bak.1700000000.1", bak17)
+    check("backup: ledger recorded", st17.get("backups") == [bak17], str(st17.get("backups")))
+    check("backup: ledger persisted", g.load_state().get("backups") == [bak17],
+          str(g.load_state().get("backups")))
+    bak17b = g.write_block(st17)                        # same second again
+    check("backup: second collision bumped", bak17b == f"{lf}.bak.1700000000.2", bak17b)
+    check("backup: ledger holds both", st17["backups"] == [bak17, bak17b], str(st17["backups"]))
+    check("backup: victim still untouched", open(victim).read() == "VICTIM")
+    g.STATE_PATH, g.LOOKNFEEL, g.time.time = _sp17, _lk17, _tm17
+
+# ── 18. prune: only ledgered backups; foreign files survive ──────────
+with tempfile.TemporaryDirectory() as td18:
+    _sp18, _lk18, _tm18 = g.STATE_PATH, g.LOOKNFEEL, g.time.time
+    g.STATE_PATH = os.path.join(td18, "glass.json")
+    lf = os.path.join(td18, "looknfeel.lua")
+    open(lf, "w").write("x\n")
+    g.LOOKNFEEL = lf
+    st18 = g.sanitize_state(g.copy.deepcopy(g.DEFAULT_STATE))
+    made = []
+    for i in range(12):
+        g.time.time = lambda i=i: 1710000000 + i
+        made.append(g.write_block(st18))
+    check("prune: write made 12 backups", len(made) == 12, str(made))
+    check("prune: ledger trimmed to 10", len(st18["backups"]) == 10, str(st18["backups"]))
+    check("prune: oldest two deleted",
+          not os.path.exists(made[0]) and not os.path.exists(made[1])
+          and all(os.path.exists(p) for p in made[2:]))
+    foreign = f"{lf}.bak.1234567890"                    # matches pattern, not ledgered
+    open(foreign, "w").write("someone else's backup")
+    foreign2 = f"{lf}.bak.1234567890.7"
+    open(foreign2, "w").write("also foreign")
+    other = f"{lf}.mybackup"
+    open(other, "w").write("user data")
+    g.prune_backups(st18)
+    check("prune: foreign pattern file survives", os.path.exists(foreign))
+    check("prune: foreign suffixed file survives", os.path.exists(foreign2))
+    check("prune: non-pattern user file survives", os.path.exists(other))
+    g.STATE_PATH, g.LOOKNFEEL, g.time.time = _sp18, _lk18, _tm18
+
+# ── 19. reads/writes refuse symlinks & special files (no follow) ─────
+with tempfile.TemporaryDirectory() as td19:
+    _sp19, _lk19 = g.STATE_PATH, g.LOOKNFEEL
+    g.STATE_PATH = os.path.join(td19, "glass.json")
+    target = os.path.join(td19, "target.lua")
+    open(target, "w").write("-- target\n")
+    link = os.path.join(td19, "looknfeel.lua")
+    os.symlink(target, link)
+    g.LOOKNFEEL = link
+    try:
+        g.load_text(link)
+        check("nofollow: symlink read refused", False)
+    except g.CtlError as e:
+        check("nofollow: symlink read refused",
+              "regular file" in str(e) or "symlink" in str(e), str(e))
+    st19 = g.sanitize_state(g.copy.deepcopy(g.DEFAULT_STATE))
+    try:
+        g.write_block(st19)
+        check("nofollow: symlink write refused", False)
+    except g.CtlError as e:
+        check("nofollow: symlink write refused", "regular file" in str(e), str(e))
+    check("nofollow: target untouched", open(target).read() == "-- target\n")
+    check("nofollow: no backup on refusal", not g.glob.glob(link + ".bak.*"))
+    fifo = os.path.join(td19, "fifo.lua")
+    os.mkfifo(fifo)
+    g.LOOKNFEEL = fifo
+    try:
+        g.load_text(fifo)
+        check("nofollow: fifo read refused", False)
+    except g.CtlError as e:
+        check("nofollow: fifo read refused", "regular file" in str(e), str(e))
+    try:
+        g.write_block(st19)
+        check("nofollow: fifo write refused", False)
+    except g.CtlError:
+        check("nofollow: fifo write refused", True)
+    os.unlink(fifo)
+    big = os.path.join(td19, "big.lua")
+    with open(big, "w") as fh:
+        fh.write("x" * (g.LOOKNFEEL_MAX_BYTES + 1))
+    g.LOOKNFEEL = big
+    try:
+        g.load_text(big)
+        check("nofollow: oversized read refused", False)
+    except g.CtlError as e:
+        check("nofollow: oversized read refused", "larger" in str(e), str(e))
+    g.LOOKNFEEL = os.path.join(td19, "gone.lua")
+    check("nofollow: missing read still empty", g.load_text(g.LOOKNFEEL) == "")
+    g.STATE_PATH, g.LOOKNFEEL = _sp19, _lk19
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES out of {checks_run}: {failures}")

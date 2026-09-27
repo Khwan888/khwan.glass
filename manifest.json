@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "khwan.glass",
   "name": "Glass",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "Gordon Wan",
   "license": "MIT",
   "description": "Milky-glass control panel for the omarchy bar: frosted window opacity, compositor blur, rounding, and dim — 10 styles (9 looks + Stock), sync-all, style tour, undo — live-apply while dragging.",

@@ -176,6 +176,22 @@ b8 = g.gen_block(s8)
 check("sync block has no class rules", 'class =' not in b8, b8)
 check("sync keeps global rule", 'o.window(".*", { opacity = "0.85 0.85" })' in b8)
 
+# ── 8b. payload merge: row ✕ removal — present apps/keepSolid replace ─
+s8b = g.sanitize_state(g.deep_merge(
+    g.copy.deepcopy(g.DEFAULT_STATE),
+    {"frost": {"apps": {"kitty": 0.5, "vlc": 0.9}, "keepSolid": ["mpv"]}}))
+m8b = g.merge_payload(g.copy.deepcopy(s8b), {"frost": {"apps": {"vlc": 0.9}}})
+check("payload merge drops withheld row", "kitty" not in m8b["frost"]["apps"],
+      str(m8b["frost"]))
+check("payload merge keeps listed row", m8b["frost"]["apps"].get("vlc") == 0.9)
+check("payload merge keeps keepSolid when absent", m8b["frost"]["keepSolid"] == ["mpv"])
+m8c = g.merge_payload(g.copy.deepcopy(s8b), {"frost": {"all": 0.7}})
+check("payload merge absent apps leaves rows",
+      m8c["frost"]["apps"] == {"kitty": 0.5, "vlc": 0.9} and m8c["frost"]["all"] == 0.7,
+      str(m8c["frost"]))
+m8d = g.merge_payload(g.copy.deepcopy(s8b), {"frost": {"keepSolid": []}})
+check("payload merge keepSolid wipe", m8d["frost"]["keepSolid"] == [])
+
 # ── 9. user presets: save / apply (replace) / delete / guards ─────────
 s9 = g.sanitize_state(g.deep_merge(g.copy.deepcopy(g.DEFAULT_STATE),
                                    {"frost": {"apps": {"com.nousresearch.hermes": 0.82}}}))

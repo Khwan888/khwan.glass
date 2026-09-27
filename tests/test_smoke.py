@@ -227,6 +227,67 @@ check("S12 readback reads live value",
       j and j["state"]["blur"]["size"] in (9, 10),
       str(j and j.get("state", {}).get("blur")))
 
+# ── S13. per-app rows: ✕ removal must drop the row (regression — the frost
+#        payload carries the full trimmed apps dict; removal used to be
+#        impossible outside Sync all, bug report 2026-09-28) ────────────
+sb4 = Sandbox()
+sb4.seed("-- seed\n")
+FROSTP = '{"frost":{"all":0.85,"apps":%s,"keepSolid":%s}}'
+
+
+def s13_apps():
+    try:
+        return json.load(open(sb4.state))["frost"]["apps"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+p = sb4.run("frost", FROSTP % ('{"kitty":0.5,"zathura":0.9}', "[]"))
+check("S13 add rows exit 0", p.returncode == 0, p.stderr)
+check("S13 add rows in state", s13_apps() == {"kitty": 0.5, "zathura": 0.9},
+      str(s13_apps()))
+block13 = sb4.read(sb4.lf)
+check("S13 add rows in block",
+      'class = "kitty"' in block13 and 'class = "zathura"' in block13)
+
+p = sb4.run("frost", FROSTP % ('{"kitty":0.7,"zathura":0.9}', "[]"))
+check("S13 slider update applies", s13_apps() == {"kitty": 0.7, "zathura": 0.9},
+      str(s13_apps()))
+
+p = sb4.run("frost", FROSTP % ('{"zathura":0.9}', "[]"))
+check("S13 ✕ removes row from state", s13_apps() == {"zathura": 0.9}, str(s13_apps()))
+block13 = sb4.read(sb4.lf)
+check("S13 ✕ removes rule from block",
+      'class = "kitty"' not in block13 and 'class = "zathura"' in block13, block13)
+
+p = sb4.run("frost", FROSTP % ("{}", "[]"))
+check("S13 ✕ last row: apps empty", s13_apps() == {}, str(s13_apps()))
+block13 = sb4.read(sb4.lf)
+check("S13 ✕ last row: no class rules left", "class =" not in block13, block13)
+check("S13 ✕ last row: global rule intact", 'opacity = "0.85 0.85"' in block13)
+
+# absent apps key means "leave rows alone" (all-only payloads rely on this)
+sb4.run("frost", FROSTP % ('{"kitty":0.5}', "[]"))
+sb4.run("frost", '{"frost":{"all":0.7}}')
+check("S13 all-only payload keeps rows", s13_apps() == {"kitty": 0.5}, str(s13_apps()))
+
+# undo/applySnap merges snapshots through `set` — same replace semantics
+p = sb4.run("set", '{"frost":{"all":0.7,"apps":{},"keepSolid":[]}}')
+check("S13 set snapshot removes rows", s13_apps() == {}, str(s13_apps()))
+
+# keepSolid (S toggle) replaces wholesale — pin it stays that way
+sb4.run("frost", FROSTP % ("{}", '["mpv"]'))
+st13 = json.load(open(sb4.state))
+check("S13 keepSolid add", st13["frost"]["keepSolid"] == ["mpv"], str(st13["frost"]))
+sb4.run("frost", FROSTP % ("{}", "[]"))
+st13 = json.load(open(sb4.state))
+check("S13 keepSolid remove", st13["frost"]["keepSolid"] == [], str(st13["frost"]))
+
+# sync still wipes everything (the old escape hatch keeps working)
+sb4.run("frost", FROSTP % ('{"kitty":0.5}', "[]"))
+sb4.run("sync")
+check("S13 sync still wipes", s13_apps() == {} and "class =" not in sb4.read(sb4.lf))
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES out of {checks_run}: {failures}")

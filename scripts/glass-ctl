@@ -267,6 +267,31 @@ def deep_merge(base: dict, extra: dict) -> dict:
     return base
 
 
+# Payload writers merge user changes over the file state. deep_merge alone
+# can only add/update keys inside frost.apps — a removal (payload dict with
+# a row gone, possibly empty) cannot be expressed in a dict-to-dict merge,
+# so the removed row resurrected from the file (bug report 2026-09-28: the
+# row ✕ did nothing; only Sync all, which wipes explicitly, removed rows).
+# When the payload carries these keys they win wholesale — mirroring
+# load_state's disk-side rule for the same two keys. (Lists replace either
+# way, which is why the keepSolid S-toggle never showed the bug.)
+PAYLOAD_REPLACE_FROST_KEYS = ("apps", "keepSolid")
+
+
+def merge_payload(base: dict, payload: dict) -> dict:
+    """deep_merge, then the payload wins wholesale for frost.apps /
+    frost.keepSolid when it carries them — so a payload that no longer
+    lists a class actually removes it. Absent key means "leave rows alone"
+    (preset-style all-only payloads must not wipe per-app rows)."""
+    merged = deep_merge(base, payload)
+    pf = payload.get("frost") if isinstance(payload, dict) else None
+    if isinstance(pf, dict):
+        for key in PAYLOAD_REPLACE_FROST_KEYS:
+            if key in pf:
+                merged["frost"][key] = copy.deepcopy(pf[key])
+    return merged
+
+
 def clamp(value, lo, hi):
     try:
         v = float(value)
@@ -742,7 +767,7 @@ def cmd_readback() -> int:
 
 
 def cmd_set(payload: str) -> int:
-    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    state = sanitize_state(merge_payload(load_state(), json.loads(payload or "{}")))
     save_state(state)
     code, out = apply_live(state)
     if code != 0:
@@ -760,7 +785,7 @@ def cmd_set(payload: str) -> int:
 
 def cmd_live(payload: str) -> int:
     """Drag ticks: live-apply blur/shapes only. No writes."""
-    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    state = sanitize_state(merge_payload(load_state(), json.loads(payload or "{}")))
     code, out = apply_live(state)
     if code != 0:
         print(json.dumps({"ok": False, "error": out.strip()}))
@@ -771,7 +796,7 @@ def cmd_live(payload: str) -> int:
 
 def cmd_frost(payload: str) -> int:
     """Slider release: persist + block rewrite + reload."""
-    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    state = sanitize_state(merge_payload(load_state(), json.loads(payload or "{}")))
     save_state(state)
     code, out = apply_frost(state)
     if code != 0:
@@ -784,7 +809,7 @@ def cmd_frost(payload: str) -> int:
 def cmd_persist(payload: str) -> int:
     """Blur/shapes release: persist + block rewrite, NO reload (the change is
     already live; the block keeps it across the next reload)."""
-    state = sanitize_state(deep_merge(load_state(), json.loads(payload or "{}")))
+    state = sanitize_state(merge_payload(load_state(), json.loads(payload or "{}")))
     save_state(state)
     write_block(state)
     code, out = apply_live(state)
